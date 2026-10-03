@@ -1,0 +1,22 @@
+[package]
+name = "wdb"
+version = "0.2.2"
+edition = "2024"
+rust-version = "1.99"
+description = "Wildbits Debug Bridge for JR2 and K2"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+serde = { version = "1", features = ["derive"] }
+serialport = { version = "4", default-features = false }
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true

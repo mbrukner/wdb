@@ -1,0 +1,13 @@
+# Copy to ./wdb.toml or ~/.config/wdb/wdb.toml.
+target = "k2" # "jr2" or "k2"
+# With one board connected the correct debug channel is discovered automatically.
+# device = "138SA20405" # USB serial, or e.g. "usb:1-5"; see `wdb devices`
+# port = "/dev/serial/by-id/your-debug-interface" # Explicit path/TCP override
+cpu = "65c02" # "65c02" or "65816"
+baud = 6000000
+timeout = 60
+chunk_size = 1024
+flash_size = 524288
+address = "0" # Default dump address; hexadecimal string
+# label_file = "program.lbl"
+# state_dir = "/path/to/wdb-state"
