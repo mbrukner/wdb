@@ -4,6 +4,7 @@ use crate::{
     config::Config,
     keyboard::{self, Input},
     loader::{self, Format, Image},
+    progress::Progress,
     protocol::{self, Capabilities, DebugPort},
     state::{State, Stopped},
     transport::Transport,
@@ -146,8 +147,13 @@ fn sector_image(path: &Path) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn verify_flash(dp: &mut Port, offset: u32, data: &[u8]) -> Result<()> {
-    let actual = dp.read(protocol::FLASH_BASE + offset, data.len())?;
+fn verify_flash(
+    dp: &mut Port,
+    offset: u32,
+    data: &[u8],
+    progress: impl FnMut(usize),
+) -> Result<()> {
+    let actual = dp.read_progress(protocol::FLASH_BASE + offset, data.len(), progress)?;
     if let Some(first) = actual.iter().zip(data).position(|(a, b)| a != b) {
         let mismatches = actual.iter().zip(data).filter(|(a, b)| a != b).count();
         anyhow::bail!(
@@ -171,22 +177,42 @@ fn flash_source(cfg: &Config) -> Result<u32> {
     Ok(address)
 }
 
-fn program_sector(dp: &mut Port, sector: u8, data: &[u8], erase: bool, source: u32) -> Result<()> {
-    dp.write(source, data)?;
+const SECTOR_WORK: usize = 8192 * 3 + 3;
+
+fn program_sector(
+    dp: &mut Port,
+    sector: u8,
+    data: &[u8],
+    erase: bool,
+    source: u32,
+    mut progress: impl FnMut(&str, usize),
+) -> Result<()> {
+    progress("write RAM", 0);
+    dp.write_progress(source, data, |done| progress("write RAM", done))?;
+    progress("check RAM", data.len());
     ensure!(
-        dp.read(source, data.len())? == data,
+        dp.read_progress(source, data.len(), |done| progress(
+            "check RAM",
+            data.len() + done
+        ))? == data,
         "RAM staging readback mismatch at {source:06X}; flash has not been programmed for sector {sector:02X}"
     );
     if erase {
         for half in 0..2 {
+            progress(
+                if half == 0 { "erase 1/2" } else { "erase 2/2" },
+                data.len() * 2 + half as usize,
+            );
             dp.transfer(
                 protocol::ERASE_SECTOR,
                 (u32::from(sector) * 2 + half) << 16,
                 &[],
                 0,
-            )?;
+            )
+            .with_context(|| format!("erase half {} of flash sector {sector:02X}", half + 1))?;
         }
     }
+    progress("program", data.len() * 2 + 2);
     dp.transfer(
         protocol::PROGRAM_SECTOR,
         (u32::from(sector) * 2) << 16,
@@ -195,7 +221,17 @@ fn program_sector(dp: &mut Port, sector: u8, data: &[u8], erase: bool, source: u
     )?;
     // Unified RTL acknowledges flash commands only after its timed operation
     // completes; no additional host-side delay is necessary.
-    verify_flash(dp, u32::from(sector) * 8192, data)
+    progress("verify", data.len() * 2 + 3);
+    verify_flash(dp, u32::from(sector) * 8192, data, |done| {
+        progress("verify", data.len() * 2 + 3 + done)
+    })
+}
+
+fn erase_flash(dp: &mut Port, quiet: bool) -> Result<()> {
+    let progress = Progress::new("Erasing flash", 1, quiet);
+    dp.command(protocol::ERASE_FLASH)?;
+    progress.finish();
+    Ok(())
 }
 
 struct Sector {
@@ -407,7 +443,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 info(quiet, "Cancelled.");
                 return Ok(());
             }
-            with_debug(&cfg, |dp| dp.command(protocol::ERASE_FLASH))?;
+            with_debug(&cfg, |dp| erase_flash(dp, quiet))?;
             info(quiet, "Firmware flash erased.");
         }
         Command::Flash {
@@ -427,7 +463,15 @@ pub fn run(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
                 let source = flash_source(&cfg)?;
-                with_debug(&cfg, |dp| program_sector(dp, sector, &data, true, source))?;
+                with_debug(&cfg, |dp| {
+                    let mut progress =
+                        Progress::new(format!("(1/1) Sector {sector:02X}"), SECTOR_WORK, quiet);
+                    program_sector(dp, sector, &data, true, source, |stage, done| {
+                        progress.stage(stage, done)
+                    })?;
+                    progress.finish();
+                    Ok(())
+                })?;
             } else {
                 let address =
                     address.context("full flash programming requires --address for RAM staging")?;
@@ -450,21 +494,37 @@ pub fn run(cli: Cli) -> Result<()> {
                     return Ok(());
                 }
                 with_debug(&cfg, |dp| {
-                    dp.write(address, &data)?;
+                    let mut progress = Progress::new("(1/5) Staging RAM", data.len(), quiet);
+                    dp.write_progress(address, &data, |done| progress.update(done))?;
+                    progress.finish();
+                    let mut progress = Progress::new("(2/5) Checking RAM", data.len(), quiet);
                     ensure!(
-                        dp.read(address, data.len())? == data,
+                        dp.read_progress(address, data.len(), |done| progress.update(done))?
+                            == data,
                         "RAM staging readback mismatch at {address:06X}; flash has not been erased"
                     );
+                    progress.finish();
+                    let progress = Progress::new("(3/5) Erasing flash", 1, quiet);
                     dp.command(protocol::ERASE_FLASH)?;
+                    progress.finish();
+                    let mut progress =
+                        Progress::new("(4/5) Programming flash", 64 * SECTOR_WORK, quiet);
                     State::new(&cfg)?.set_flash_source(address)?;
+                    progress.stage("program", 0);
                     dp.transfer(protocol::PROGRAM_FLASH, address, &[], 0)?;
+                    progress.update(SECTOR_WORK);
                     // Current unified RTL stops 0x10 after 8 KiB. Explicitly
                     // program every remaining sector. This is also correct
                     // on revisions where 0x10 programs the complete image.
                     for (sector, chunk) in data.chunks(8192).enumerate().skip(1) {
-                        program_sector(dp, sector as u8, chunk, false, address)?;
+                        program_sector(dp, sector as u8, chunk, false, address, |stage, done| {
+                            progress.stage(stage, sector * SECTOR_WORK + done)
+                        })?;
                     }
-                    verify_flash(dp, 0, &data)?;
+                    progress.finish();
+                    let mut progress = Progress::new("(5/5) Verifying flash", data.len(), quiet);
+                    verify_flash(dp, 0, &data, |done| progress.update(done))?;
+                    progress.finish();
                     Ok(())
                 })?;
             }
@@ -490,18 +550,35 @@ pub fn run(cli: Cli) -> Result<()> {
             }
             with_debug(&cfg, |dp| {
                 if erase {
-                    dp.command(protocol::ERASE_FLASH)?;
+                    erase_flash(dp, quiet)?;
                 }
-                for sector in &plan {
-                    program_sector(dp, sector.number, &sector.data, !erase, source).with_context(
-                        || {
-                            format!(
-                                "sector {:02X} from {}",
-                                sector.number,
-                                sector.path.display()
-                            )
-                        },
-                    )?;
+                for (index, sector) in plan.iter().enumerate() {
+                    let mut progress = Progress::new(
+                        format!(
+                            "({}/{}) Sector {:02X}",
+                            index + 1,
+                            plan.len(),
+                            sector.number
+                        ),
+                        SECTOR_WORK,
+                        quiet,
+                    );
+                    program_sector(
+                        dp,
+                        sector.number,
+                        &sector.data,
+                        !erase,
+                        source,
+                        |stage, done| progress.stage(stage, done),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "sector {:02X} from {}",
+                            sector.number,
+                            sector.path.display()
+                        )
+                    })?;
+                    progress.finish();
                 }
                 Ok(())
             })?;

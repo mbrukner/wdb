@@ -574,18 +574,42 @@ fn full_flash_stages_complete_image_before_erasing() {
     let d = device(2, 5, None);
     let data: Vec<u8> = (0..512 * 1024).map(|i| (i / 8192) as u8).collect();
     std::fs::write(dir.path().join("flash.bin"), data).unwrap();
-    success(&invoke(
+    let output = invoke(
         dir.path(),
         &d.port,
         &["flash", "flash.bin", "--address", "10000", "--yes"],
-    ));
+    );
+    success(&output);
+    let progress = String::from_utf8_lossy(&output.stderr);
+    for phase in [
+        "Staging RAM",
+        "Checking RAM",
+        "Erasing flash",
+        "Programming flash",
+        "Verifying flash",
+    ] {
+        assert!(progress.contains(phase));
+    }
+    assert_eq!(progress.matches("100%").count(), 5);
+    assert!(!progress.contains(['\r', '\x1b']));
+    assert!(output.stdout.is_empty());
     assert_eq!(state(dir.path(), &d.port).flash_source().unwrap(), 0x10000);
     std::fs::write(dir.path().join("sector.bin"), vec![0xCD; 8192]).unwrap();
-    success(&invoke(
+    let output = invoke(
         dir.path(),
         &d.port,
-        &["flash", "sector.bin", "--flash-sector", "02", "--yes"],
-    ));
+        &[
+            "flash",
+            "sector.bin",
+            "--flash-sector",
+            "02",
+            "--yes",
+            "--quiet",
+        ],
+    );
+    success(&output);
+    assert!(output.stderr.is_empty());
+    assert!(output.stdout.is_empty());
     let requests = d.worker.join().unwrap();
     assert!(requests[1..513].iter().all(|r| r[1] == 1));
     assert!(requests[513..1025].iter().all(|r| r[1] == 0));
@@ -600,6 +624,28 @@ fn full_flash_stages_complete_image_before_erasing() {
     assert_eq!(sectors, (1..64).map(|i| i * 2).collect::<Vec<u8>>());
     assert!(requests[end - 512..end].iter().all(|r| r[1] == 0));
     assert_eq!(&requests[end + 2][2..5], [1, 0, 0]);
+}
+
+#[test]
+fn flash_failure_identifies_the_pending_operation() {
+    for (command, stage) in [
+        (protocol::ERASE_SECTOR, "erase 1/2"),
+        (protocol::PROGRAM_SECTOR, "program"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let d = device(1, 5, Some(command));
+        std::fs::write(dir.path().join("sector.bin"), vec![0xCD; 8192]).unwrap();
+        let output = invoke(
+            dir.path(),
+            &d.port,
+            &["flash", "sector.bin", "--flash-sector", "01", "--yes"],
+        );
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains(&format!("(1/1) Sector 01: {stage}...")));
+        assert!(!error.contains("100%"));
+        assert_eq!(d.worker.join().unwrap().last().unwrap()[1], command);
+    }
 }
 
 #[test]
@@ -665,6 +711,8 @@ fn bulk_flash_verifies_delayed_readback_but_rejects_real_corruption() {
         if corrupt {
             let error = String::from_utf8_lossy(&output.stderr);
             assert!(error.contains("sector 3B from 3b.bin"));
+            assert!(error.contains("(1/1) Sector 3B: failed"));
+            assert!(!error.contains("100%"));
             assert!(error.contains("offset 076001 (physical FF6001): expected 01, read 81"));
             assert!(!commands(&requests).contains(&0x81));
             assert_eq!(

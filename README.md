@@ -53,7 +53,7 @@ cpu = "65c02"
 ```
 
 With that saved in `wdb.toml`, commands become `wdb reset`, `wdb key enter`, etc.
-`--quiet` suppresses progress on stderr while retaining command results on stdout.
+`--quiet` suppresses informational messages on stderr while retaining command results on stdout.
 Transport reads and writes use `--timeout` seconds (default 60).
 
 ## USB discovery
@@ -277,5 +277,9 @@ Protocol constants and feature gates are centralized in `src/protocol.rs`.
 The CLI and configuration expose only JR2/K2 targets; future FPGA commands can
 add explicit capability requirements there.
 
-MIT licensed. The included license preserves attribution for the original
-implementation from which protocol and loader behavior were ported.
+wdb's protocol and executable-loader support builds on
+[FoenixMgr](https://github.com/pweingar/FoenixMgr), the original Python tool by
+[Peter Weingartner (@pweingar)](https://github.com/pweingar). Thanks to Peter and
+the FoenixMgr contributors for their work.
+
+MIT licensed. Copyright (c) 2026 Matthias Brukner.

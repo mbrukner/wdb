@@ -131,6 +131,14 @@ impl<T: Read + Write> DebugPort<T> {
         Ok(self.transfer(REVISION, 0, &[], 0)?.status[1])
     }
     pub fn read(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
+        self.read_progress(address, length, |_| {})
+    }
+    pub fn read_progress(
+        &mut self,
+        address: u32,
+        length: usize,
+        mut progress: impl FnMut(usize),
+    ) -> Result<Vec<u8>> {
         check_range(address, length)?;
         let mut data = Vec::with_capacity(length);
         while data.len() < length {
@@ -144,6 +152,7 @@ impl<T: Read + Write> DebugPort<T> {
                     .min((FLASH_BASE - current) as usize);
                 data.extend(self.transfer(READ, current, &[], size)?.data);
             }
+            progress(data.len());
         }
         Ok(data)
     }
@@ -189,9 +198,18 @@ impl<T: Read + Write> DebugPort<T> {
         Ok(bytes[shift..shift + size].to_vec())
     }
     pub fn write(&mut self, address: u32, data: &[u8]) -> Result<()> {
+        self.write_progress(address, data, |_| {})
+    }
+    pub fn write_progress(
+        &mut self,
+        address: u32,
+        data: &[u8],
+        mut progress: impl FnMut(usize),
+    ) -> Result<()> {
         check_range(address, data.len())?;
         for (index, chunk) in data.chunks(self.chunk_size).enumerate() {
             self.transfer(WRITE, address + (index * self.chunk_size) as u32, chunk, 0)?;
+            progress(index * self.chunk_size + chunk.len());
         }
         Ok(())
     }

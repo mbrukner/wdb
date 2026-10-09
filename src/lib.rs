@@ -5,6 +5,7 @@ pub mod config;
 pub mod discovery;
 pub mod keyboard;
 pub mod loader;
+mod progress;
 pub mod protocol;
 pub mod state;
 pub mod transport;
